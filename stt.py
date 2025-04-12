@@ -2,18 +2,16 @@ import whisper
 from pydub import AudioSegment
 import os
 import uuid
+import io
 
-model = whisper.load_model("base")  # You can use "small" or "medium" if needed
+# Load Whisper model once
+model = whisper.load_model("base")  # "tiny" or "small" may be faster for streaming
 
 def transcribe_audio(audio_data: bytes, input_format: str = "wav") -> str:
-    # Generate a unique filename
     temp_filename = f"temp_{uuid.uuid4()}.{input_format}"
-
-    # Save raw audio data to file
     with open(temp_filename, "wb") as f:
         f.write(audio_data)
 
-    # Convert to wav if needed (Twilio might send audio in mp3, etc.)
     if input_format != "wav":
         audio = AudioSegment.from_file(temp_filename, format=input_format)
         wav_filename = temp_filename.replace(f".{input_format}", ".wav")
@@ -21,10 +19,15 @@ def transcribe_audio(audio_data: bytes, input_format: str = "wav") -> str:
         os.remove(temp_filename)
         temp_filename = wav_filename
 
-    # Transcribe using Whisper
     result = model.transcribe(temp_filename)
-    
-    # Clean up
     os.remove(temp_filename)
-
     return result["text"]
+
+def transcribe_partial(audio_chunk: bytes) -> str:
+    try:
+        audio_io = io.BytesIO(audio_chunk)
+        result = model.transcribe(audio_io, fp16=False, verbose=False)
+        return result.get("text", "")
+    except Exception as e:
+        print(f"[transcribe_partial ERROR] {e}")
+        return ""

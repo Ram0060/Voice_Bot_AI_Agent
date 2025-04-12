@@ -1,118 +1,148 @@
-from fastapi import APIRouter, Request, BackgroundTasks
-from fastapi.responses import PlainTextResponse
-from twilio.twiml.voice_response import VoiceResponse
-from app.stt import transcribe_audio
-from app.config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, GCP_BUCKET_NAME
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, FileResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect
+from twilio.rest import Client
+
+from app.stt import transcribe_partial
+from app.config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, BASE_WEBHOOK_URL
 from app.assistant import get_assistant_response
 from app.tts import text_to_speech
 from app.gcs import upload_file_to_gcs
 
-from pydub import AudioSegment
-import requests
-import uuid
 import os
-import time
+import uuid
+import openai
+import json
+import base64
+import wave
 
 router = APIRouter()
+AUDIO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "audio_responses"))
+conversation_history = {}
 
-# STEP 1: Greet the caller and ask them to leave a message
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
 @router.post("/voice")
-async def voice_webhook():
-    response = VoiceResponse()
-    response.say("Hi! Please leave your message after the beep. Press any key when you're done.", voice="alice")
-    response.record(
-        action="/twilio/recording",
-        method="POST",
-        max_length=60,
-        timeout=5,
-        finish_on_key="#",
-        recording_status_callback="/twilio/recording-status"
-    )
-    response.say("Thanks! Goodbye.")
-    return PlainTextResponse(str(response), media_type="application/xml")
-
-
-# STEP 2: Log when recording is marked complete by Twilio
-@router.post("/recording-status")
-async def recording_status_webhook(request: Request):
+async def voice_webhook(request: Request):
     form = await request.form()
-    print(f"🎯 Twilio says recording is completed — duration: {form.get('RecordingDuration')} sec")
-    print(f"🎯 ✅ Recording is ready: {form.get('RecordingUrl')}")
-    return PlainTextResponse("OK")
+    call_sid = form.get("CallSid")
 
+    if call_sid not in conversation_history:
+        thread = openai.beta.threads.create()
+        conversation_history[call_sid] = {
+            "thread_id": thread.id,
+            "turns": [],
+            "audio_input_chunks": bytearray()
+        }
 
-# STEP 3: Handle voice recording webhook and start transcription
-@router.post("/recording")
-async def recording_webhook(request: Request, background_tasks: BackgroundTasks):
-    form = await request.form()
-    recording_url = form.get("RecordingUrl")
-
-    print(f"[Twilio] Received recording URL: {recording_url}")
-    background_tasks.add_task(handle_transcription, recording_url)
-
+    stream_url = f"{request.base_url}twilio/stream"
     response = VoiceResponse()
-    response.say("Thanks for your message. We'll get back to you shortly.", voice="alice")
-    return PlainTextResponse(str(response), media_type="application/xml")
+    connect = Connect()
+    connect.stream(url=stream_url)
+    response.append(connect)
+    return HTMLResponse(content=str(response), media_type="application/xml")
 
+@router.websocket("/twilio/stream")
+async def twilio_stream(websocket: WebSocket):
+    await websocket.accept()
+    call_sid = str(uuid.uuid4())
+    thread_id = None
 
-# STEP 4: Download, re-encode, transcribe with Whisper, and call Assistant
-def handle_transcription(recording_url: str):
     try:
-        raw_path = f"raw_{uuid.uuid4()}"
-        clean_path = f"clean_{uuid.uuid4()}.wav"
+        async for message in websocket.iter_text():
+            data = json.loads(message)
 
-        print("⏳ Waiting for recording to be fully available...")
-        time.sleep(5)
+            if data.get("event") == "start":
+                call_sid = data["streamSid"]
+                if call_sid not in conversation_history:
+                    thread = openai.beta.threads.create()
+                    conversation_history[call_sid] = {
+                        "thread_id": thread.id,
+                        "turns": [],
+                        "audio_input_chunks": bytearray()
+                    }
+                thread_id = conversation_history[call_sid]["thread_id"]
 
-        # Download audio
-        response = requests.get(recording_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-        content_type = response.headers.get("Content-Type", "")
-        print(f"[DEBUG] Content-Type from Twilio: {content_type}")
+            elif data.get("event") == "media":
+                audio_payload = data["media"]["payload"]
+                audio_bytes = base64.b64decode(audio_payload)
+                conversation_history[call_sid]["audio_input_chunks"].extend(audio_bytes)
 
-        if "audio" not in content_type:
-            raise ValueError(f"Invalid response from Twilio — Content-Type: {content_type}")
+            elif data.get("event") == "stop":
+                audio_bytes = conversation_history[call_sid]["audio_input_chunks"]
+                transcription = transcribe_partial(audio_bytes)
+                print(f"📝 Transcription: {transcription}")
 
-        ext = content_type.split("/")[-1]
-        raw_path += f".{ext}"
-        with open(raw_path, "wb") as f:
-            f.write(response.content)
+                if transcription.lower().strip() in ["bye", "goodbye", "exit"]:
+                    finalize_and_upload(call_sid)
+                    await websocket.close()
+                    return
 
-        audio = AudioSegment.from_file(raw_path)
-        print(f"🎧 Clean audio duration: {audio.duration_seconds:.2f} seconds")
+                reply = get_assistant_response(transcription, thread_id)
+                print(f"🤖 Assistant: {reply}")
 
-        audio.export(clean_path, format="wav")
-        os.remove(raw_path)
+                tts_path = text_to_speech(reply)
+                filename = os.path.basename(tts_path)
 
-        with open(clean_path, "rb") as f:
-            audio_bytes = f.read()
+                conversation_history[call_sid]["turns"].append({
+                    "user": transcription,
+                    "assistant": reply
+                })
 
-        transcription = transcribe_audio(audio_bytes, input_format="wav")
-        print("\n📜 Transcription:")
-        print(transcription)
-        print("📜 End of Transcription\n")
+                conversation_history[call_sid]["audio_input_chunks"] = bytearray()
 
-        assistant_reply = get_assistant_response(transcription)
-        print("🤖 Assistant Response:")
-        print(assistant_reply)
+                # ✅ Redirect Twilio to play audio via BASE_WEBHOOK_URL
+                client.calls(call_sid).update(
+                    url=f"{BASE_WEBHOOK_URL}/twilio/play_audio?filename={filename}",
+                    method="POST"
+                )
 
-        # Convert to speech
-        tts_path = text_to_speech(assistant_reply)
+                await websocket.close()
+                return
 
-        # Upload to GCS with debug
-        print("📦 Attempting to upload to GCS...")
-        print("🔍 File exists:", os.path.exists(tts_path))
-        print("📍 TTS path:", tts_path)
-        print("🪣 Bucket name:", GCP_BUCKET_NAME)
+    except WebSocketDisconnect:
+        print("⚠️ WebSocket disconnected.")
+    except Exception as e:
+        print(f"[ERROR] WebSocket stream failed: {e}")
 
-        try:
-            public_url = upload_file_to_gcs(tts_path)
-            print(f"✅ File uploaded successfully! Public URL: {public_url}")
-        except Exception as upload_error:
-            print(f"[GCS ERROR] Upload failed: {upload_error}")
+@router.post("/play_audio")
+async def play_audio(request: Request):
+    form = await request.form()
+    filename = form.get("filename") or request.query_params.get("filename")
 
-        # Clean up
-        os.remove(clean_path)
-        os.remove(tts_path)
+    response = VoiceResponse()
+    response.play(f"{request.base_url}twilio/static-audio/{filename}")
+    response.redirect(f"{request.base_url}twilio/voice")
+    return HTMLResponse(str(response), media_type="application/xml")
+
+@router.get("/static-audio/{filename}")
+async def static_audio(filename: str):
+    filepath = os.path.join(AUDIO_DIR, filename)
+    return FileResponse(path=filepath, media_type="audio/mpeg")
+
+def finalize_and_upload(call_sid: str):
+    history = conversation_history.get(call_sid)
+    if not history:
+        return
+
+    try:
+        wav_path = os.path.join(AUDIO_DIR, f"{call_sid}_raw_input.wav")
+        with wave.open(wav_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(8000)
+            wf.writeframes(history["audio_input_chunks"])
+        upload_file_to_gcs(wav_path)
+        os.remove(wav_path)
+
+        txt_path = os.path.join(AUDIO_DIR, f"{call_sid}_transcript.txt")
+        with open(txt_path, "w") as f:
+            for turn in history["turns"]:
+                f.write(f"User: {turn['user']}\nAssistant: {turn['assistant']}\n\n")
+        upload_file_to_gcs(txt_path)
+        os.remove(txt_path)
 
     except Exception as e:
-        print(f"[ERROR] Transcription pipeline failed: {e}")
+        print(f"[Finalize ERROR]: {e}")
+
+    del conversation_history[call_sid]
